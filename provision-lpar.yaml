@@ -1,0 +1,624 @@
+# @@SGM needs std headers and inline doc
+#
+# Steve Maher: provision_host.yml
+#
+#     provision AIX/Linux LPARs on IBM Power9 & storwize
+#
+# dependencies:
+#       vars/storagewize_name.yml       contains storagwize specific variables
+#       vars/cec-name.yml
+#       vars/viosname.yml
+#       lpar/name_of_lpar.yml           contains the storage/lpar definitions
+#
+############################################################
+# This play book will connect to both the storagwize server
+# and the hmc and define the storage and lpar for a base 
+# lpar with 1 rootvg disk - size is specifified in variables
+#
+# the storage will be presented to the vios that the storagwize is configured
+# to point to - we need to improve that part as the storagewize could point
+# to multiple sources - unlikely but this play does not take that into account.
+#
+# 
+
+- hosts: localhost
+  gather_facts: no
+
+  tasks:
+    # Include the LPAR definition 
+    # ---------------------------------------------------------------
+    - include_vars: "file=lpar/lpar_name.domain.com.yml"
+    # Include the storagewize settings for the lpar we are creating
+    # ---------------------------------------------------------------
+    - include_vars: "file=vars/{{ storwize }}.yml"
+    - include_vars: "file=vars/{{ managed_system_name }}.yml"
+
+    # Has the rootvg disk been defined already for this LPAR
+    # ---------------------------------------------------------------
+    - name: Has the rootvg disk already been created
+      raw: "lsvdisk -delim : {{ shortname }}_rootvg"
+      remote_user: "{{ remote_user }}"
+      delegate_to: "{{ storwize }}"
+      ignore_errors: true
+      register: result
+      check_mode: no
+
+    - set_fact:
+        rootvg_data: "{{ rootvg_data | default({}) | combine ( { item.split(':')[0]: item.split(':')[1] | default({}) } ) }}"
+      with_items: "{{ result.stdout_lines }}"
+
+    - debug:
+        var: rootg_data
+        verbosity: 2
+
+    - name: Find the mapping of the vios
+      raw: "lshost -nohdr -delim :"
+      remote_user: "{{ remote_user }}"
+      delegate_to: "{{ storwize }}"
+      ignore_errors: true
+      register: result
+      check_mode: no
+
+    - set_fact:
+        host_mapping: "{{ host_mapping | default({}) | combine ( { item.split(':')[1]: item.split(':')[0] } ) }}"
+      with_items: "{{ result.stdout_lines }}"
+
+    - debug:
+        var: host_mapping
+        verbosity: 2
+
+    # Create the rootvg disk as its not been defined
+    # ---------------------------------------------------------------
+    - name: define rootvg volume
+      block:
+        - name: define rootvg volume
+          raw: "mkvdisk -mdiskgrp {{ storwize_diskgrp }}  -name {{ shortname }}_rootvg -size {{ rootvg_size }} -unit gb"
+          remote_user: "{{ remote_user }}"
+          delegate_to: "{{ storwize }}"
+          ignore_errors: false
+          register: output
+
+        - set_fact:
+            created_rootvg: true
+      rescue:
+        - set_fact:
+            created_rootvg: false
+
+      when: not rootvg_data.name
+
+    - debug:
+        var: rootvg_data.name
+
+    # Wait {{retries*deply}} for the volume if its being formatted
+    # ---------------------------------------------------------------
+    - name: Check the disk is formatted
+      raw: "lsvdisk -filtervalue formatting=yes {{ shortname }}_rootvg"
+      remote_user: "{{ remote_user }}"
+      delegate_to: "{{ storwize }}"
+      ignore_errors: true
+      register: result
+      check_mode: no
+      until: result.stdout.find("CMMVC5804E") != -1
+      retries: 10
+      delay: 60
+
+    # Check to see if the volue is already mapped to the VIOS
+    # ---------------------------------------------------------------
+    - name: Check if LUN is already presented
+      raw: "lsvdiskhostmap -nohdr {{ shortname }}_rootvg "
+      remote_user: "{{ remote_user }}"
+      delegate_to: "{{ storwize }}"
+      ignore_errors: true
+      register: disk_mapped
+
+    # map the volume to the VIOS 
+    # ---------------------------------------------------------------
+    - name: map volume to the VIOS if we cant find it already listed mapping for the LUN
+      raw: "mkvdiskhostmap -force -host {{ item.value }}"
+      remote_user: "{{ remote_user }}"
+      delegate_to: "{{ storwize }}"
+      with_dict: "{{ host_mapping }}"
+      ignore_errors: true
+      when: disk_mapped.stdout.find(shortname) == -1 and not ansible_check_mode
+
+    - debug: 
+        var: hostvars['localhost']
+        verbosity: 4
+
+
+- hosts: localhost
+  gather_facts: no
+
+  tasks:
+    # Include the LPAR definition 
+    # ---------------------------------------------------------------
+    - include_vars: "file=lpar/sgmtst01.tech.lastmile.com.yml"
+    # Include the settings for the HMC referenced in the LPAR definition
+    # ---------------------------------------------------------------
+    - include_vars: "file=vars/{{ hmc }}.yml"
+
+    - name: Get NIM master
+      command: /usr/bin/awk -F'=' '/NIM_MASTER_HOSTNAME/ { print $2 }' /etc/niminfo
+      register: nim_master_hostname
+      check_mode: no
+
+    # Define a NIM object for the LPAR
+    # ---------------------------------------------------------------
+    - name: Define NIM object for new LPAR
+      block:
+        - name: Does the LPAR exist?
+          command: "/usr/sbin/lsnim -t standalone {{ shortname }}"
+      rescue:
+        - name: Define the LPAR to NIM
+          command: "/usr/sbin/nim -o define -t standalone -a connect=nimsh  -a platform='chrp' -a if1='find_net {{ shortname }} 0' {{ shortname }}"
+          when: not ansible_check_mode
+
+    # Create the LPAR definition string that will be passed
+    # to the HMC to define the LPAR, ensure we have defaults
+    # to allow the op to provide the least possible info.
+    # ---------------------------------------------------------------
+    - set_fact:
+        lpar_definition:
+          - "name={{ lpar_name | default(shortname) }}"
+          - "profile_name={{ profile_name | default('default') }}"
+          - "lpar_env={{ lpar_env | default('aixlinux') }}"
+          - "min_mem={{ min_mem | default('2048') }}"
+          - "desired_mem={{ desired_mem | default('4096') }}"
+          - "max_mem={{ max_mem | default('8194') }}"
+          - "min_proc_units={{ min_proc_units | default('0.2') }}"
+          - "desired_proc_units={{ desired_proc_units | default('0.5') }}"
+          - "max_proc_units={{ max_proc_units | default('1.0') }}"
+          - "min_procs={{ min_procs | default('1') }}"
+          - "desired_procs={{ desired_procs | default('1') }}"
+          - "max_procs={{ max_procs | default('2') }}"
+          - "shared_proc_pool_id={{ shared_proc_pool_id | default('0') }} " 
+          - "uncap_weight={{ uncap_weight | default('128') }}"
+          - "max_virtual_slots={{ max_virtual_slots | default('20') }}"
+          - "allow_perf_collection={{ allow_perf_collection | default('1') }}"
+          - "sharing_mode={{sharing_mode | default('uncap') }}"
+          - "proc_mode={{ proc_mode | default('shared') }}"
+          - "mem_mode={{ mem_mode | default('ded') }}"
+
+
+    # Test for existing LPAR definition
+    # ---------------------------------------------------------------
+    - name: check for existing LPAR
+      raw: "lssyscfg -m {{ managed_system_name }} -r lpar --filter 'lpar_names={{ shortname }}' -Fname,state"
+      delegate_to: "{{ hmc }}"
+      remote_user: "{{ hmc_user }}"
+      ignore_errors: true
+      register: lssyscfg
+      check_mode: no
+
+    - debug:
+        var: lssyscfg.stdout
+
+    # Get the used ETH and SCSI slots as we need to use empty slots
+    # ---------------------------------------------------------------
+    - name: Get USED ETH slots
+      raw: "lshwres -r virtualio --rsubtype scsi -m {{ managed_system_name }} --level lpar --filter lpar_ids={{ item.id }} -F slot_num"
+      delegate_to: "{{ hmc }}"
+      remote_user: "{{ hmc_user }}"
+      ignore_errors: true
+      with_items: "{{ vios }}"
+      check_mode: no
+      register: slots_used_eth
+
+    - debug:
+        var: slots_used_eth
+        verbosity: 2
+      
+    - name: Get USED SCSI slots
+      raw: "lshwres -r virtualio --rsubtype scsi -m {{ managed_system_name }} --level lpar --filter lpar_ids={{ item.id }} -F slot_num"
+      delegate_to: "{{ hmc }}"
+      remote_user: "{{ hmc_user }}"
+      ignore_errors: true
+      with_items: "{{ vios }}"
+      check_mode: no
+      register: slots_used_scsi
+
+    - debug:
+        var: slots_used.scsi
+        verbosity: 2
+
+    # Retreive VIOS mapping data, we need the profile names and lpar_id's
+    # so we dont have to hard code these in playbooks, we can now just
+    # supply the VIOS names in the lpar definition and allow the play
+    # to fill in detail.
+    # ---------------------------------------------------------------
+    - name: Get VIOS profile names
+      raw: "lssyscfg -r lpar -m {{ managed_system_name }} --filter 'lpar_names={{ item.name }}' -F default_profile"
+      delegate_to: "{{ hmc }}"
+      remote_user: "{{ hmc_user }}"
+      ignore_errors: true
+      with_items: "{{ vios }}"
+      check_mode: no
+      register: output
+
+    - debug:
+        var: output
+        verbosity: 2
+
+    - name:  retrieve VIOS default profile names
+      set_fact: 
+        vios_profiles: "{{ vios_profiles | default({}) | combine( { item.item.name: item.stdout_lines[0] } ) }}"
+      with_items: "{{ output.results }}"
+
+    - debug:
+        var: vios_profiles
+        verbosity: 2
+
+    - name: Get VIOS ids 
+      raw: "lssyscfg -r lpar -m {{ managed_system_name }} --filter 'lpar_names={{ item.name }}' -F lpar_id"
+      delegate_to: "{{ hmc }}"
+      remote_user: "{{ hmc_user }}"
+      ignore_errors: true
+      with_items: "{{ vios }}"
+      check_mode: no
+      register: output
+
+    - debug:
+        var: output
+        verbosity: 2
+
+    - name:  retrieve VIOS default ids
+      set_fact: 
+        vios_ids: "{{ vios_ids | default({}) | combine( { item.item.name: item.stdout_lines[0] } ) }}"
+      with_items: "{{ output.results }}"
+
+    - debug:
+        var: vios_ids
+
+    # Combile all the slot numbers, we dont want to use any of these ids
+    # and that will ensure a consistent slot number on the vios.
+    # We combine the list, then unique the list.
+    # ---------------------------------------------------------------
+    - set_fact:
+        slots: "{{ slots_used_eth.results[0].stdout_lines + slots_used_eth.results[1].stdout_lines + slots_used_scsi.results[0].stdout_lines + slots_used_scsi.results[1].stdout_lines }}"
+
+    - set_fact:
+        slots: "{{ slots |  unique | sort }}"
+        vscsi_server_offset: "{{ vscsi_server_offset | default(0) }}"
+        client_offset: "{{ client_offset | default(0) }}"
+
+    # Note that client slots normally can be allocated from 2 upwards
+    # slot0 and slot1 are isually Virtual Serial Adapters
+    # if you have anything special in your lpar then you may need to 
+    # add client_offset to your vars file or check that slots 
+    # after generating the base lpar.
+    # ---------------------------------------------------------------
+    - set_fact:
+        client_slot: "{{ ( client_offset | int + 2 ) }}"
+        server_slot: "{{ ( slots | max | int + 1 + ( vscsi_server_offset | int ) ) }}"
+        lpar_created: false
+
+    # 
+    # ---------------------------------------------------------------
+    - debug:
+        var: slots
+        verbosity: 2
+
+    - debug:
+        var: server_slot 
+        verbosity: 2
+
+    - debug:
+        var: client_slot 
+        verbosity: 2
+
+    # Create the basic LPAR if it does not already exists
+    # ---------------------------------------------------------------
+    - name: "creating LPAR"
+      block:
+        - name: "creating LPAR"
+          raw: "mksyscfg -r lpar -m {{ managed_system_name }} -i {{ lpar_definition | join(',') }}"
+          delegate_to: "{{ hmc }}"
+          remote_user: "{{ hmc_user }}"
+          ignore_errors: false
+          register: result
+
+        - set_fact:
+            lpar_created: true 
+
+      rescue:
+        - set_fact:
+            lpar_created: false
+      when:
+        - not ansible_check_mode 
+        - "'was not found' in lssyscfg.stdout"
+    
+    # Check that LPAR is not activated, we should never continue
+    # if its in a Running state (or some others TBD...)
+    # ---------------------------------------------------------------
+    - name: Check LPAR is not activated 
+      fail:
+        msg: "LPAR is activated already, if you intend to re-install this host please power it off first."
+      failed_when: 
+        - "'Running' in lssyscfg.stdout"
+
+    - name: get lpar_id
+      raw: "lssyscfg -r lpar -m {{ managed_system_name }} --filter 'lpar_names={{ shortname }}' -F lpar_id"
+      delegate_to: "{{ hmc }}"
+      remote_user: "{{ hmc_user }}"
+      check_mode: no
+      register: result
+
+    - set_fact:
+        lpar_id: "{{ result.stdout_lines[0] }}"
+
+    - set_fact: 
+        lpar_id_hex: "{{ '%0x' % ( lpar_id | int ) }}"
+
+    - debug:
+        var: lpar_id
+        verbosity: 2
+
+    - debug:
+        var: lpar_id_hex
+        verbosity: 2
+
+    # Add Addapters to the VIOS  
+    # we add dlpar + add to the profile as usually we are building
+    # new and we want them available now, hence the dlpar.
+    # we could just dlpar and allow the profile to autosave on HMC8+
+    # but lets not gamble.
+    # ---------------------------------------------------------------
+
+
+    # Add the network adapters to the LPAR
+    # ---------------------------------------------------------------
+    - name: "Add network adapters"
+      debug:
+        msg: "chsyscfg -r prof -m {{ managed_system_name }} -i name={{ profile_name | default('default') }},lpar_name={{ shortname }},virtual_eth_adapters+='{{ item.0 | int + ( client_slot | int ) }}/0/{{ item.1.name }}//0/0/{{ item.1.vswitch }}'"
+        #delegate_to: "{{ hmc }}"
+        #remote_user: "{{ hmc_user }}"
+      ignore_errors: true
+      loop: "{{ range(0, ( vlans | length ) ) | product(vlans) | list  }}"
+    
+    # increment the client slot numbers by the number of vlans
+    # that we have just added to the lpar
+    # ---------------------------------------------------------------
+    - set_fact:
+        client_slot: "{{ client_slot | int + ( vlans | length ) }}"
+
+    # gratuitous debuging during testing of vscsi creation
+    # ---------------------------------------------------------------
+    - debug:
+        msg: "chhwres -r virtualio -m {{ managed_system_name }} -o a --id {{ item.1.id }} --rsubtype scsi -s {{ item.0 | int + ( server_slot | int ) }} -a adapter_type=server,remote_lpar_name={{ shortname }},remote_slot_num={{ ( item.0 | int + ( client_slot | int ) ) }}"
+        #verbosity: 2
+      loop: "{{ range(0,vscsi_adapters) | product(vios) | list }}"
+
+    - debug:
+        msg: "chsyscfg -r prof -m {{ managed_system_name }} -i 'name={{ vios_profiles[item.1.name] }},lpar_id={{ item.1.id }},virtual_scsi_adapters+={{ item.0 | int + ( server_slot | int ) }}/server//{{ shortname }}/{{ item.0 | int + ( client_slot | int ) }}/0'"
+        #verbosity: 2
+      loop: "{{ range(0,vscsi_adapters) | product(vios) | list }}"
+
+    # - meta: end_play
+
+    # Add the storage adapters via DLPAR
+    # ---------------------------------------------------------------
+    - block:
+        - name: "DLPAR VSCSI adapters to VIOS"
+          raw: "chhwres -r virtualio -m {{ managed_system_name }} -o a --id {{ item.1.id }} --rsubtype scsi -s {{ item.0 | int + ( server_slot | int ) }} -a 'adapter_type=server,remote_lpar_name={{ shortname }},remote_slot_num={{ item.0 | int + ( client_slot | int ) }}'"
+          delegate_to: "{{ hmc }}"
+          remote_user: "{{ hmc_user }}"
+          ignore_errors: true
+          register: result
+          loop: "{{ range(0,vscsi_adapters) | product(vios) | list }}"
+      rescue:
+        - name: "DLPAR VSCSI adapters to VIOS"
+          raw: "lshwres -r virtualio -m {{ managed_system_name }}--rsubtype scsi"
+          delegate_to: "{{ hmc }}"
+          remote_user: "{{ hmc_user }}"
+          ignore_errors: true
+          register: result
+
+        - debug:
+            msg: "{{ result }}"
+      when: 
+        - not ansible_check_mode
+        - lpar_created == true
+
+    - block:
+        - name: "Add VSCSI adapters to VIOS profile - warning - this can fail if autosave of profiles is turned on"
+          raw: "chsyscfg -r prof -m {{ managed_system_name }} -i 'name={{ vios_profiles[item.1.name] }},lpar_id={{ item.1.id }},virtual_scsi_adapters+={{ item.0 | int + ( server_slot | int ) }}/server//{{ shortname }}/{{ item.0 | int + ( client_slot | int ) }}/0'"
+          delegate_to: "{{ hmc }}"
+          remote_user: "{{ hmc_user }}"
+          ignore_errors: false
+          register: result
+          loop: "{{ range(0,vscsi_adapters) | product(vios) | list }}"
+      rescue:
+        - name: "Display the profiles"
+          raw: "lssyscfg -r prof -m {{ managed_system_name }} --filter 'lpar_names={{ item.1.name }},,profile_names={{ vios_profiles[item.1.name] }}'"
+          delegate_to: "{{ hmc }}"
+          remote_user: "{{ hmc_user }}"
+          register: result
+          loop: "{{ range(0,vscsi_adapters) | product(vios) | list }}"
+
+        - debug:
+            msg: "{{ result }}"
+      when: 
+        - not ansible_check_mode
+        - lpar_created == true
+
+    # Add the LPAR scsi adapters
+    # ---------------------------------------------------------------
+    - name: "Add VSCSI adapters LPAR"
+      raw: "chsyscfg -r prof -m {{ managed_system_name }} -i 'name={{ profile_name | default('default') }},lpar_name={{ shortname }},virtual_scsi_adapters+={{ item.0 | int + ( client_slot | int ) }}/client/{{ item.1.id }}/{{ item.1.name }}/{{ item.0 | int + ( server_slot | int ) }}/0' "
+      delegate_to: "{{ hmc }}"
+      remote_user: "{{ hmc_user }}"
+      ignore_errors: true
+      register: result
+      loop: "{{ range(0,vscsi_adapters) | product(vios) | list }}"
+      when: 
+        - not ansible_check_mode
+        - lpar_created == true
+
+    # Get the first vhost adapter name from the VIOS for storage allocation
+    # ---------------------------------------------------------------
+    - name: "get vhost adapter name"
+      raw: "ioscli lsmap -all -cpid {{ lpar_id_hex }} -fmt : -field svsa"
+      delegate_to: "{{ item.name }}"
+      remote_user: "{{ vios_user }}"
+      ignore_errors: false
+      register: vhosts
+      with_items: "{{ vios }}"
+
+    - name: "extract the first vhost adapter for each of the vios we are presenting the storage from"
+      set_fact:
+        vhost_adapters: >
+          {
+          {% for entry in vhosts.results -%}
+            "{{ entry.item.name }}": "{{ entry.stdout_lines[0] }}",
+          {% endfor %}
+          }
+
+    - debug:
+        var: vhost_adapters
+        verbosity: 2
+
+    # - meta: end_play
+
+    # If we have just created a volume on filer then we need to call
+    # cfgmgr/cfgdev on all vios to bring the device online
+    # we could just run on the fcs devices but saves little time.
+    # ---------------------------------------------------------------
+    - name: "run cfgdev to discover the LUN on the VIOS"
+      raw: "ioscli cfgdev"
+      delegate_to: "{{ item.name }}"
+      remote_user: "{{ vios_user }}"
+      ignore_errors: true
+      with_items: "{{ vios }}"
+      when: 
+        - not ansible_check_mode
+        - created_rootvg | default(false)
+
+
+    # We need to find the disk on the vios based on the vdisk_UID
+    # from the storage subsystem, this is held as the unique_id
+    # string on the VIOS. To get thie we need to to become root
+    # as I cannot find a easy way to get this data from the stock
+    # VIOS commands as of 3.1.0.10. We need to get the data from
+    # the lsattr or a odmget. Alternatively I'm cheating by using
+    # awk to break the rksh restricted shell and get what I need
+    # without creating more complexity in the playbook by using 
+    # expect to elevate to root using oem_setup_env.
+    #
+    #        #IBM #pSeries #VIOS #feature-request
+    #
+    # ---------------------------------------------------------------
+    - name: find the disk on the vios
+      raw: 'ioscli lspv | awk ''$3 ~ /None/ { hdisk=$1; cmd="/usr/sbin/lsattr -a unique_id -El "$1; cmd  | getline ; print substr($2,6,32),hdisk }'''
+      delegate_to: "{{ item.name }}"
+      remote_user: "{{ vios_user }}"
+      ignore_errors: true
+      with_items: "{{ vios }}"
+      register: ioscli_lspv
+
+    # - local_action: copy content="{{ result }}" dest="./lsattr.vars.yml"
+
+    - name: "extract the hdisk numbers for each of the vios we are presenting the storage from"
+      set_fact:
+        vios_hdisk_names: >
+          [
+          {% for entry in ioscli_lspv.results -%}{
+             {% for inner in entry.stdout_lines %}
+               {% if inner.split(' ')[0] == rootvg_data.vdisk_UID %}
+                 "name": "{{ entry.item.name }}",
+                 "value": "{{ inner.split(' ')[1] }}",
+               {% endif %}
+               {% endfor %}},
+          {% endfor %}
+          ]
+
+    - debug:
+        var: vios_hdisk_names
+        #verbosity: 2
+
+    # check that we have some storage to allocate, if its missing
+    # then lets call end of play as its would be daft to continue
+    # ---------------------------------------------------------------
+    - name: Checking we have LUN locations
+      debug:
+        msg: "stopping as could not find LUN locations"
+      when: vios_hdisk_names | length < 1
+
+    # @@SGM - question do do we want to check the following ??
+    #         readvgda on LUN to check for existing LVM
+    #         PVID on LUN, already allocated ? (otherwise run chdev -l xxx pv=yes
+    #         check qdepth ?
+    #
+
+    # Add the LUNS to the VTD on each VIOS
+    # ---------------------------------------------------------------
+    - name: allocate the new disks to the first vscsi device allocated
+      raw: "ioscli mkvdev -vdev {{ item.value }} -vadapter {{ vhost_adapters[item.name] }}"
+      delegate_to: "{{ item.name }}"
+      remote_user: "{{ vios_user }}"
+      ignore_errors: true
+      loop: "{{ vios_hdisk_names }}"
+
+    # We want the disks to have PVIDs 
+    # ---------------------------------------------------------------
+    - name: "find disks that are yet to be allocated"
+      raw: "ioscli lspv -free -fmt :"
+      delegate_to: "{{ item.name }}"
+      remote_user: "{{ vios_user }}"
+      ignore_errors: false
+      with_items: "{{ vios }}"
+      register: result
+
+    - debug: 
+        var: result
+        verbosity: 2
+
+    # @@SGM - noticed a bug here
+    #         we could have a disk that needs to be ASMI and this does
+    #         not account for that - it needs to check the disk is the one
+    #         that we have requested - not all free disks - review later
+    # ---------------------------------------------------------------
+    - name: "format the data for all hdisks with no pvid"
+      set_fact:
+        free_pvs: >
+          [
+          {% for entry in result.results -%}
+            {% for inner in entry.stdout_lines %}
+              {% if inner.split(':')[1] == 'none' and vios_hdisk_names[inner.split(':')[0]][value] != "" %}
+              {
+              "vios": "{{ entry.item.name }}",
+              "hdisk": "{{ inner.split(':')[0] }}",
+              "pvid": "{{ inner.split(':')[1] }}",
+              },
+              {% endif %}
+            {% endfor %}
+          {% endfor %}
+          ] 
+
+    - debug:
+        var: free_pvs
+        verbosity: 2
+
+    - name: "update pv on hdisk devices"
+      raw: "ioscli chdev -dev {{ item.hdisk }} -attr pv=yes"
+      delegate_to: "{{ item.vios }}"
+      remote_user: "{{ vios_user }}"
+      ignore_errors: true
+      loop: "{{ free_pvs }}"
+
+    - debug: 
+        var: hostvars['localhost']
+        verbosity: 4
+
+
+##    debug:
+##      msg: Define lpar
+##  - name: define VLANS 
+##    debug:
+##      msg: Define VLANS
+##  - name: define storage
+##    debug:
+##      msg: Define storage
+##  - name: lpar_netboot time
+##    debug:
+##      msg: /usr/sbin/lpar_netboot -t ent -D -s auto -d auto -S {{ nim_master_hostname }} -C {{ management_ipv4 }} -G {{ default_gateway_v4 }} -M 
+#
